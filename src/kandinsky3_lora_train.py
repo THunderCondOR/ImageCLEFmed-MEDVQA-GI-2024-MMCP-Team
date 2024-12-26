@@ -7,9 +7,10 @@ import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from diffusers import Kandinsky3Pipeline, DDPMScheduler, VQModel, Kandinsky3UNet, VQModel
+from diffusers import Kandinsky3Pipeline, DDPMScheduler, VQModel, Kandinsky3UNet
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import compute_snr
+from transformers import T5Tokenizer, T5EncoderModel
 from peft import LoraConfig
 from peft import get_peft_model
 from tqdm import tqdm
@@ -19,7 +20,6 @@ from PIL import Image
 from config.config import get_cfg_defaults
 from dataset import Kandinsky3Dataset, ClefFIDDataset
 from torchmetrics_pr_recall import ImprovedPrecessionRecall
-import h5py
 
 
 def parse_args():
@@ -59,7 +59,7 @@ def image_grid(imgs, rows, cols):
     w, h = imgs[0].size
     grid = Image.new('RGB', size=(cols*w, rows*h))
     grid_w, grid_h = grid.size
-    
+
     for i, img in enumerate(imgs):
         grid.paste(img, box=(i % cols * w, i // cols * h))
     return grid
@@ -81,7 +81,7 @@ def get_snr_loss(loss, snr_gamma, noise_scheduler, timesteps):
 
 @torch.no_grad()
 def get_noisy_latents(movq, noise_scheduler, pixel_values):
-    latents = movq.encode(pixel_values.to(dtype=torch.float32)).latents #d * movq.config.scaling_factor
+    latents = movq.encode(pixel_values.to(dtype=torch.float32)).latents
 
     noise = torch.randn_like(latents)
 
@@ -103,10 +103,10 @@ def get_target(cfg, noise_scheduler, latents, noise, timesteps):
         return noise_scheduler.get_velocity(latents, noise, timesteps)
     else:
         raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-    
+
 
 @torch.no_grad()
-def validation_epoch(cfg, accelerator, unet, val_dataloader, movq, noise_scheduler):
+def validation_epoch(cfg, accelerator, unet, text_encoder, val_dataloader, movq, noise_scheduler):
     unet.eval()
     validation_loss = 0.0
     validation_batch_sum = 0.0
@@ -115,9 +115,12 @@ def validation_epoch(cfg, accelerator, unet, val_dataloader, movq, noise_schedul
         noisy_latents, timesteps, noise, latents = get_noisy_latents(movq, noise_scheduler, val_batch["pixel_values"])
         target = get_target(cfg, noise_scheduler, latents, noise, timesteps)
 
-        encoded_text = val_batch["hidden_states"] * val_batch["attention_mask"].unsqueeze(2)
+        with torch.no_grad():
+            encoder_hidden_states = text_encoder(val_batch["input_ids"], return_dict=False)[0]
 
-        model_pred = unet(noisy_latents, timesteps, encoded_text, val_batch["attention_mask"], return_dict=False)[0] #[:, :4]
+        encoded_text = encoder_hidden_states * val_batch["attention_mask"].unsqueeze(2)
+
+        model_pred = unet(noisy_latents, timesteps, encoded_text, val_batch["attention_mask"], return_dict=False)[0]  # [:, :4]
 
         loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
         loss = get_snr_loss(loss, cfg['SCHEDULER']['SNR_GAMMA'], noise_scheduler, timesteps)
@@ -129,7 +132,7 @@ def validation_epoch(cfg, accelerator, unet, val_dataloader, movq, noise_schedul
     return validation_loss / validation_batch_sum
 
 
-def training_epoch(cfg, accelerator, unet, lora_layers, train_dataloader, movq, noise_scheduler, optimizer, lr_scheduler, progress_bar, global_step):
+def training_epoch(cfg, accelerator, unet, text_encoder, lora_layers, train_dataloader, movq, noise_scheduler, optimizer, lr_scheduler, progress_bar, global_step):
     unet.train()
     train_epoch_loss = 0.0
     train_epoch_batch_sum = 0.0
@@ -140,10 +143,13 @@ def training_epoch(cfg, accelerator, unet, lora_layers, train_dataloader, movq, 
             noisy_latents, timesteps, noise, latents = get_noisy_latents(movq, noise_scheduler, train_batch["pixel_values"])
             target = get_target(cfg, noise_scheduler, latents, noise, timesteps)
 
-            encoded_text = train_batch["hidden_states"] * train_batch["attention_mask"].unsqueeze(2)
+            with torch.no_grad():
+                encoder_hidden_states = text_encoder(train_batch["input_ids"], return_dict=False)[0]
 
-            model_pred = unet(noisy_latents, timesteps, encoded_text, train_batch["attention_mask"], return_dict=False)[0] #[:, :4]
-            
+            encoded_text = encoder_hidden_states * train_batch["attention_mask"].unsqueeze(2)
+
+            model_pred = unet(noisy_latents, timesteps, encoded_text, train_batch["attention_mask"], return_dict=False)[0]  # [:, :4]
+
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
             loss = get_snr_loss(loss, cfg['SCHEDULER']['SNR_GAMMA'], noise_scheduler, timesteps)
 
@@ -186,7 +192,7 @@ def count_image_metrics(cfg, accelerator, pipeline, generator, fid_dataloader):
                                max_sequence_length=64,
                                output_type='pt').images
         fake_images = (fake_images * 0.5 + 0.5).clamp(0, 1)
-        
+
         torchmetrics_fid.update(fake_images, real=False)
         pr_metric.update(fake_images, real=False)
 
@@ -223,14 +229,14 @@ def main():
     set_seed(cfg['SYSTEM']['RANDOM_SEED'])
 
     noise_scheduler = DDPMScheduler.from_pretrained(cfg['PATHS']['KANDINSKY3_PATH'], subfolder="scheduler", local_files_only=cfg['PATHS']['LOCAL_FILES_ONLY'])
-    #tokenizer = T5Tokenizer.from_pretrained(cfg['PATHS']['KANDINSKY3_PATH'], subfolder="tokenizer", local_files_only=cfg['PATHS']['LOCAL_FILES_ONLY'])
-    #text_encoder = T5EncoderModel.from_pretrained(cfg['PATHS']['KANDINSKY3_PATH'], subfolder="text_encoder", use_safetensors=True, variant="fp16", local_files_only=cfg['PATHS']['LOCAL_FILES_ONLY'])
+    tokenizer = T5Tokenizer.from_pretrained(cfg['PATHS']['KANDINSKY3_PATH'], subfolder="tokenizer", local_files_only=cfg['PATHS']['LOCAL_FILES_ONLY'])
+    text_encoder = T5EncoderModel.from_pretrained(cfg['PATHS']['KANDINSKY3_PATH'], subfolder="text_encoder", use_safetensors=True, variant="fp16", local_files_only=cfg['PATHS']['LOCAL_FILES_ONLY'])
     movq = VQModel.from_pretrained(cfg['PATHS']['KANDINSKY3_PATH'], subfolder="movq", use_safetensors=True, variant="fp16", local_files_only=cfg['PATHS']['LOCAL_FILES_ONLY'])
     unet = Kandinsky3UNet.from_pretrained(cfg['PATHS']['KANDINSKY3_PATH'], subfolder="unet", use_safetensors=True, variant="fp16", local_files_only=cfg['PATHS']['LOCAL_FILES_ONLY'])
 
     unet.requires_grad_(False)
     movq.requires_grad_(False)
-    #text_encoder.requires_grad_(False)
+    text_encoder.requires_grad_(False)
 
     for param in unet.parameters():
         param.requires_grad_(False)
@@ -238,8 +244,6 @@ def main():
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
 
     unet_lora_config = LoraConfig(
         r=cfg['LORA']['RANK'],
@@ -250,7 +254,7 @@ def main():
 
     unet.to(accelerator.device, dtype=weight_dtype)
     movq.to(accelerator.device, dtype=torch.float32)
-    #text_encoder.to(accelerator.device, dtype=weight_dtype)
+    text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     unet = get_peft_model(unet, unet_lora_config)
     unet.print_trainable_parameters()
@@ -258,7 +262,7 @@ def main():
     for p in unet.parameters():
         if p.requires_grad:
             p.data = p.to(torch.float32)
-    
+
     lora_layers = filter(lambda p: p.requires_grad, unet.parameters())
 
     optimizer_cls = torch.optim.AdamW
@@ -271,24 +275,14 @@ def main():
         eps=cfg['OPTIMIZER']['ADAM_EPSILON']
     )
 
-    train_texts_file = h5py.File(cfg['PATHS']['KANDINSKY3_CLEF_PREENCODED_TRAIN'], 'r')
-    valid_texts_file = h5py.File(cfg['PATHS']['KANDINSKY3_CLEF_PREENCODED_VALID'], 'r')
-    
-    train_dataset = Kandinsky3Dataset(cfg['PATHS']['CLEF_DATASET_IMAGES_PATH'], cfg['PATHS']['CLEF_DATASET_TEXTS_TRAIN_PATH'], texts_file=train_texts_file, image_file_col='Filename', resolution=cfg['TRAIN']['TRAIN_IMAGE_RESOLUTION'])
-    val_dataset = Kandinsky3Dataset(cfg['PATHS']['CLEF_DATASET_IMAGES_PATH'], cfg['PATHS']['CLEF_DATASET_TEXTS_VALID_PATH'], texts_file=valid_texts_file, image_file_col='Filename', resolution=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'])
-    fid_dataset = ClefFIDDataset(cfg['PATHS']['CLEF_DATASET_IMAGES_PATH'], cfg['PATHS']['CLEF_DATASET_ALL_TEXTS_PATH'], image_file_col='Filename', captions_col='Prompt', resolution=cfg['TRAIN']['FID_IMAGE_RESOLUTION']) 
-    
-    def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        attention_mask = torch.stack([example["attention_mask"] for example in examples])
-        hidden_states = torch.stack([example["hidden_states"] for example in examples])
-        return {"pixel_values": pixel_values, "attention_mask": attention_mask, "hidden_states": hidden_states}
+    train_dataset = Kandinsky3Dataset(cfg['PATHS']['CLEF_DATASET_IMAGES_PATH'], cfg['PATHS']['CLEF_DATASET_TEXTS_TRAIN_PATH'], tokenizer=tokenizer, resolution=cfg['TRAIN']['TRAIN_IMAGE_RESOLUTION'], padding=cfg['TRAIN']['IMAGE_PADDING'])
+    val_dataset = Kandinsky3Dataset(cfg['PATHS']['CLEF_DATASET_IMAGES_PATH'], cfg['PATHS']['CLEF_DATASET_TEXTS_VALID_PATH'], tokenizer=tokenizer, resolution=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'], padding=cfg['TRAIN']['IMAGE_PADDING'])
+    fid_dataset = ClefFIDDataset(cfg['PATHS']['CLEF_DATASET_IMAGES_PATH'], cfg['PATHS']['CLEF_DATASET_ALL_TEXTS_PATH'], resolution=cfg['TRAIN']['FID_IMAGE_RESOLUTION'], padding=cfg['TRAIN']['IMAGE_PADDING'])
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
-        collate_fn=collate_fn,
+        collate_fn=Kandinsky3Dataset.collate_fn,
         batch_size=cfg['TRAIN']['TRAIN_BATCH_SIZE'],
         num_workers=cfg['TRAIN']['DATALOADER_NUM_WORKERS'],
         pin_memory=True
@@ -297,7 +291,7 @@ def main():
     val_dataloader = torch.utils.data.DataLoader(
         val_dataset,
         shuffle=False,
-        collate_fn=collate_fn,
+        collate_fn=Kandinsky3Dataset.collate_fn,
         batch_size=cfg['TRAIN']['VAL_BATCH_SIZE'],
         num_workers=cfg['TRAIN']['DATALOADER_NUM_WORKERS'],
     )
@@ -327,25 +321,25 @@ def main():
     )
 
     val_texts = ['Generate an image with 1 finding.',
-                'Generate an image containing text.',
-                'Generate an image with an abnormality with the colors pink, red and white.',
-                'Generate an image not containing a green/black box artefact.',
-                'Generate an image containing a polyp.',
-                'Generate an image containing a green/black box artefact.',
-                'Generate an image with no polyps.',
-                'Generate an image with an an instrument located in the lower-right and lower-center.',
-                'Generate an image containing a green/black box artefact.']
-    
+                 'Generate an image containing text.',
+                 'Generate an image with an abnormality with the colors pink, red and white.',
+                 'Generate an image not containing a green/black box artefact.',
+                 'Generate an image containing a polyp.',
+                 'Generate an image containing a green/black box artefact.',
+                 'Generate an image with no polyps.',
+                 'Generate an image with an an instrument located in the lower-right and lower-center.',
+                 'Generate an image containing a green/black box artefact.']
+
     val_texts_paraphrased = ['Create an image displaying a single abnormality.',
-                            'Generate a medical image showing text.',
-                            'Create a medical image displaying an anomaly characterized by shades of red and pink.',
-                            'Create an image without any presence of an artifact in the form of a green or black box.',
-                            'Create an image displaying a single polyp.',
-                            'Create an image featuring a green/black box artifact.',
-                            'Create a medical image showing an absence of polyps.',
-                            'Create a medical image showcasing the use of a single medical tool located in the lower-right and lower-center.',
-                            'Create a visual representation without showing any medical tools or equipment.']
-    
+                             'Generate a medical image showing text.',
+                             'Create a medical image displaying an anomaly characterized by shades of red and pink.',
+                             'Create an image without any presence of an artifact in the form of a green or black box.',
+                             'Create an image displaying a single polyp.',
+                             'Create an image featuring a green/black box artifact.',
+                             'Create a medical image showing an absence of polyps.',
+                             'Create a medical image showcasing the use of a single medical tool located in the lower-right and lower-center.',
+                             'Create a visual representation without showing any medical tools or equipment.']
+
     polyp_text = ['generate an image containing a polyp']
 
     val_caption = " ;\n".join([f'{number}) {caption}' for number, caption in enumerate(val_texts)])
@@ -362,14 +356,16 @@ def main():
         disable=not accelerator.is_local_main_process
     )
 
+    best_fid = 1e10
+
     for epoch in range(first_epoch, cfg['TRAIN']['NUM_EPOCHS']):
-        train_loss, global_step = training_epoch(cfg, accelerator, unet, lora_layers, train_dataloader, movq, noise_scheduler, optimizer, lr_scheduler, progress_bar, global_step)
+        train_loss, global_step = training_epoch(cfg, accelerator, unet, text_encoder, lora_layers, train_dataloader, movq, noise_scheduler, optimizer, lr_scheduler, progress_bar, global_step)
         accelerator.log({"Train Loss": train_loss}, step=epoch)
 
         if accelerator.is_main_process:
-            val_loss = validation_epoch(cfg, accelerator, unet, val_dataloader, movq, noise_scheduler)
+            val_loss = validation_epoch(cfg, accelerator, unet, text_encoder, val_dataloader, movq, noise_scheduler)
             log_dict = {"Val Loss": val_loss}
-            
+
             if epoch == 0 or (epoch + 1) % cfg['TRAIN']['IMAGE_VALIDATION_EPOCHS'] == 0 or epoch == cfg['TRAIN']['NUM_EPOCHS'] - 1:
                 pipeline = Kandinsky3Pipeline.from_pretrained(
                     cfg['PATHS']['KANDINSKY3_PATH'],
@@ -383,7 +379,7 @@ def main():
                 )
                 pipeline = pipeline.to(accelerator.device)
                 pipeline.set_progress_bar_config(disable=True)
-                
+
                 generator = torch.Generator(device=accelerator.device)
                 generator = generator.manual_seed(cfg['SYSTEM']['RANDOM_SEED'])
 
@@ -419,22 +415,19 @@ def main():
                     log_dict['Precision'] = precision
                     log_dict['Recall'] = recall
                     log_dict['F1'] = 2 * (precision * recall) / (precision + recall)
-                
+
                 if cfg['EXPERIMENT']['SAVE_BEST_FID_CHECKPOINTS'] and fid_value < best_fid:
                     save_model_checkpoint(cfg, accelerator, unet)
                     best_fid = fid_value
-                
+
                 del pipeline
                 torch.cuda.empty_cache()
-                
+
             for tracker in accelerator.trackers:
                 if tracker.name == "wandb":
                     tracker.log(log_dict)
 
-
     accelerator.wait_for_everyone()
-    train_texts_file.close()
-    valid_texts_file.close()
     if accelerator.is_main_process:
         save_model_checkpoint(cfg, accelerator, unet)
     accelerator.end_training()

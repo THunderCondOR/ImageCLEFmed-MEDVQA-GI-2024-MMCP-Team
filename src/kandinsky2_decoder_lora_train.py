@@ -1,7 +1,6 @@
 import argparse
 import math
 import wandb
-import numpy as np
 import os
 
 import torch
@@ -19,11 +18,9 @@ from peft import get_peft_model
 from transformers import (CLIPImageProcessor, CLIPVisionModelWithProjection)
 
 from config.config import get_cfg_defaults
-from dataset import Kandinsky2DecoderDataset, RocoFIDDataset, ClefFIDDataset
-from medical_diffusion.metrics.torchmetrics_pr_recall import ImprovedPrecessionRecall
+from dataset import Kandinsky2DecoderDataset, ClefFIDDataset
+from msdm.metrics.torchmetrics_pr_recall import ImprovedPrecessionRecall
 
-def normalize(img):
-    return torch.stack([(b - b.min()) / (b.max() - b.min()) for b in img])
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -62,7 +59,7 @@ def image_grid(imgs, rows, cols):
     w, h = imgs[0].size
     grid = Image.new('RGB', size=(cols*w, rows*h))
     grid_w, grid_h = grid.size
-    
+
     for i, img in enumerate(imgs):
         grid.paste(img, box=(i % cols * w, i // cols * h))
     return grid
@@ -151,7 +148,7 @@ def training_epoch(cfg, accelerator, unet, lora_layers, train_dataloader, movq, 
 
             logs = {"step_loss": train_step_loss, "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
-    
+
     return train_epoch_loss / train_epoch_batch_sum, global_step
 
 
@@ -170,7 +167,7 @@ def count_image_metrics(cfg, accelerator, pipeline, generator, fid_dataloader):
                                generator=generator,
                                output_type='pt').images
         fake_images = (fake_images * 0.5 + 0.5).clamp(0, 1)
-        
+
         torchmetrics_fid.update(fake_images, real=False)
         pr_metric.update(fake_images, real=False)
 
@@ -219,13 +216,11 @@ def main():
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
 
-    if cfg['EXPERIMENT']['LOAD_LORA_WEIGHTS']:
+    if cfg['TRAIN']['LOAD_LORA_WEIGHTS']:
         unet = PeftModel.from_pretrained(unet,
                                          cfg['PATHS']['KANDINSKY2_DECODER_LORA_WEIGHTS_DIR'],
-                                         subfolder=cfg['EXPERIMENT']['KANDINSKY2_DECODER_LORA_WEIGHTS_SUBFOLDER'],
+                                         subfolder=cfg['TRAIN']['KANDINSKY2_DECODER_LORA_WEIGHTS_SUBFOLDER'],
                                          is_trainable=True)
     else:
         unet_lora_config = LoraConfig(
@@ -258,27 +253,14 @@ def main():
         eps=cfg['OPTIMIZER']['ADAM_EPSILON']
     )
 
-    def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        clip_pixel_values = torch.stack([example["clip_pixel_values"] for example in examples])
-        clip_pixel_values = clip_pixel_values.to(memory_format=torch.contiguous_format).float()
-        return {"pixel_values": pixel_values, "clip_pixel_values": clip_pixel_values}
-    
-
-    if cfg['EXPERIMENT']['DATASET_NAME'] == 'ROCO':
-        train_dataset = Kandinsky2DecoderDataset(cfg['PATHS']['ROCO_DATASET_IMAGES_TRAIN_PATH'], cfg['PATHS']['ROCO_DATASET_TEXTS_TRAIN_PATH'], image_processor, resolution=cfg['TRAIN']['TRAIN_IMAGE_RESOLUTION'])
-        val_dataset = Kandinsky2DecoderDataset(cfg['PATHS']['ROCO_DATASET_IMAGES_VALID_PATH'], cfg['PATHS']['ROCO_DATASET_TEXTS_VALID_PATH'], image_processor, resolution=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'])
-        fid_dataset = RocoFIDDataset(cfg['PATHS']['ROCO_DATASET_IMAGES_VALID_PATH'], cfg['PATHS']['ROCO_DATASET_TEXTS_VALID_PATH'], resolution=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'])
-    else:
-        train_dataset = Kandinsky2DecoderDataset(cfg['PATHS']['CLEF_DATASET_IMAGES_PATH'], cfg['PATHS']['CLEF_DATASET_TEXTS_TRAIN_PATH'], image_processor, image_column_name='Filename', resolution=cfg['TRAIN']['TRAIN_IMAGE_RESOLUTION'])
-        val_dataset = Kandinsky2DecoderDataset(cfg['PATHS']['CLEF_DATASET_IMAGES_PATH'], cfg['PATHS']['CLEF_DATASET_TEXTS_VALID_PATH'], image_processor, image_column_name='Filename', resolution=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'])
-        fid_dataset = ClefFIDDataset(cfg['PATHS']['CLEF_DATASET_IMAGES_PATH'], cfg['PATHS']['CLEF_DATASET_ALL_TEXTS_PATH'], image_file_col='Filename', captions_col='Prompt', resolution=cfg['TRAIN']['FID_IMAGE_RESOLUTION'])
+    train_dataset = Kandinsky2DecoderDataset(cfg['PATHS']['CLEF_DATASET_IMAGES_PATH'], cfg['PATHS']['CLEF_DATASET_TEXTS_TRAIN_PATH'], image_processor, resolution=cfg['TRAIN']['TRAIN_IMAGE_RESOLUTION'], padding=cfg['TRAIN']['IMAGE_PADDING'])
+    val_dataset = Kandinsky2DecoderDataset(cfg['PATHS']['CLEF_DATASET_IMAGES_PATH'], cfg['PATHS']['CLEF_DATASET_TEXTS_VALID_PATH'], image_processor, resolution=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'], padding=cfg['TRAIN']['IMAGE_PADDING'])
+    fid_dataset = ClefFIDDataset(cfg['PATHS']['CLEF_DATASET_IMAGES_PATH'], cfg['PATHS']['CLEF_DATASET_ALL_TEXTS_PATH'], resolution=cfg['TRAIN']['FID_IMAGE_RESOLUTION'], padding=cfg['TRAIN']['IMAGE_PADDING'])
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
-        collate_fn=collate_fn,
+        collate_fn=Kandinsky2DecoderDataset.collate_fn,
         batch_size=cfg['TRAIN']['TRAIN_BATCH_SIZE'],
         num_workers=cfg['TRAIN']['DATALOADER_NUM_WORKERS'],
         pin_memory=True
@@ -287,7 +269,7 @@ def main():
     val_dataloader = torch.utils.data.DataLoader(
         val_dataset,
         shuffle=False,
-        collate_fn=collate_fn,
+        collate_fn=Kandinsky2DecoderDataset.collate_fn,
         batch_size=cfg['TRAIN']['VAL_BATCH_SIZE'],
         num_workers=cfg['TRAIN']['DATALOADER_NUM_WORKERS'],
     )
@@ -327,38 +309,26 @@ def main():
         disable=not accelerator.is_local_main_process
     )
 
-    val_texts_roco = ["KUB x-ray demonstrating the stone KUB: kidney, ureter, and bladder",
-                 "CT chest axial view showing a huge ascending aortic aneurysm (*)",
-                 "Early axial T2-weighted MRI.",
-                 "DSA showing tight left internal carotid artery stenosis.Foot note: DSA, Digital Subtraction Angiography.",
-                 "Neck and head computed tomography image showing left odontogenic infection.",
-                 "Plain film showing metallic object in appendix",
-                 "CT-scan abdomen showing the bezoar at the pylorus.",
-                 "Immediate postoperative plain radiograph showing femoral head fixation",
-                 "Barcode sign” seen in M-mode."]
-    
-    val_caption_roco = " ;\n".join([f'{number}) {caption}' for number, caption in enumerate(val_texts_roco)])
-
     val_texts_clef = ['Generate an image with 1 finding.',
-                'Generate an image containing text.',
-                'Generate an image with an abnormality with the colors pink, red and white.',
-                'Generate an image not containing a green/black box artefact.',
-                'Generate an image containing a polyp.',
-                'Generate an image containing a green/black box artefact.',
-                'Generate an image with no polyps.',
-                'Generate an image with an an instrument located in the lower-right and lower-center.',
-                'Generate an image containing a green/black box artefact.']
-    
+                      'Generate an image containing text.',
+                      'Generate an image with an abnormality with the colors pink, red and white.',
+                      'Generate an image not containing a green/black box artefact.',
+                      'Generate an image containing a polyp.',
+                      'Generate an image containing a green/black box artefact.',
+                      'Generate an image with no polyps.',
+                      'Generate an image with an an instrument located in the lower-right and lower-center.',
+                      'Generate an image containing a green/black box artefact.']
+
     val_texts_clef_paraphrased = ['Create an image displaying a single abnormality.',
-                            'Generate a medical image showing text.',
-                            'Create a medical image displaying an anomaly characterized by shades of red and pink.',
-                            'Create an image without any presence of an artifact in the form of a green or black box.',
-                            'Create an image displaying a single polyp.',
-                            'Create an image featuring a green/black box artifact.',
-                            'Create a medical image showing an absence of polyps.',
-                            'Create a medical image showcasing the use of a single medical tool located in the lower-right and lower-center.',
-                            'Create a visual representation without showing any medical tools or equipment.']
-    
+                                  'Generate a medical image showing text.',
+                                  'Create a medical image displaying an anomaly characterized by shades of red and pink.',
+                                  'Create an image without any presence of an artifact in the form of a green or black box.',
+                                  'Create an image displaying a single polyp.',
+                                  'Create an image featuring a green/black box artifact.',
+                                  'Create a medical image showing an absence of polyps.',
+                                  'Create a medical image showcasing the use of a single medical tool located in the lower-right and lower-center.',
+                                  'Create a visual representation without showing any medical tools or equipment.']
+
     polyp_text_clef = ['generate an image containing a polyp']
 
     val_caption_clef = " ;\n".join([f'{number}) {caption}' for number, caption in enumerate(val_texts_clef)])
@@ -369,12 +339,12 @@ def main():
     for epoch in range(first_epoch, cfg['TRAIN']['NUM_EPOCHS']):
         train_loss, global_step = training_epoch(cfg, accelerator, unet, lora_layers, train_dataloader, movq, image_encoder, noise_scheduler, optimizer, lr_scheduler, weight_dtype, progress_bar, global_step)
         accelerator.log({"Train Loss": train_loss}, step=epoch)
-        
+
         if accelerator.is_main_process:
             val_loss = validation_epoch(cfg, accelerator, unet, val_dataloader, movq, image_encoder, noise_scheduler, weight_dtype)
 
             log_dict = {"Val Loss": val_loss}
-            
+
             if epoch == 0 or (epoch + 1) % cfg['TRAIN']['IMAGE_VALIDATION_EPOCHS'] == 0 or epoch == cfg['TRAIN']['NUM_EPOCHS'] - 1:
                 pipeline = AutoPipelineForText2Image.from_pretrained(
                     cfg['PATHS']['KANDINSKY2_DECODER_PATH'],
@@ -385,50 +355,51 @@ def main():
                     torch_dtype=weight_dtype,
                     local_files_only=True
                 )
-                if cfg['EXPERIMENT']['LOAD_LORA_TO_PIPELINE']:
+
+                if cfg['TRAIN']['LOAD_LORA_TO_PIPELINE']:
                     pipeline.prior_prior = PeftModel.from_pretrained(pipeline.prior_prior, cfg['PATHS']['KANDINSKY2_PRIOR_LORA_WEIGHTS_DIR'], subfolder=cfg['PATHS']['KANDINSKY2_PRIOR_LORA_WEIGHTS_SUBFOLDER'])
                 pipeline = pipeline.to(accelerator.device)
                 pipeline.set_progress_bar_config(disable=True)
                 generator = torch.Generator(device=accelerator.device)
                 generator = generator.manual_seed(cfg['SYSTEM']['RANDOM_SEED'])
 
-                if cfg['EXPERIMENT']['DATASET_NAME'] == 'ROCO':
-                    val_images = pipeline(val_texts_roco, num_inference_steps=cfg['TRAIN']['NUM_INFERENCE_STEPS'], height=256, width=256, generator=generator).images
-                    log_dict["Image validation"] = wandb.Image(image_grid(val_images, 3, 3), caption=val_caption_roco)
-                else:
-                    
-                    val_images = pipeline(val_texts_clef, num_inference_steps=cfg['TRAIN']['NUM_INFERENCE_STEPS'], height=512, width=512, generator=generator).images
-                    val_images_paraphrased = pipeline(val_texts_clef_paraphrased,
-                                                    num_inference_steps=cfg['TRAIN']['NUM_INFERENCE_STEPS'],
-                                                    height=512,
-                                                    width=512,
-                                                    generator=generator).images
-                    polyp_images = pipeline(polyp_text_clef,
-                                            num_inference_steps=cfg['TRAIN']['NUM_INFERENCE_STEPS'],
-                                            height=512,
-                                            width=512,
-                                            num_images_per_prompt=9,
-                                            generator=generator).images
+                val_images = pipeline(val_texts_clef, num_inference_steps=cfg['TRAIN']['NUM_INFERENCE_STEPS'],
+                                      height=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'],
+                                      width=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'],
+                                      generator=generator).images
 
-                    log_dict["Image validation"] = wandb.Image(image_grid(val_images, 3, 3), caption=val_caption_clef)
-                    log_dict["Image Paraphrased validation"] = wandb.Image(image_grid(val_images_paraphrased, 3, 3), caption=val_clef_paraphrased_caption)
-                    log_dict["Polyp validation"] = wandb.Image(image_grid(polyp_images, 3, 3), caption=polyp_text_clef[0])
+                val_images_paraphrased = pipeline(val_texts_clef_paraphrased,
+                                                  num_inference_steps=cfg['TRAIN']['NUM_INFERENCE_STEPS'],
+                                                  height=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'],
+                                                  width=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'],
+                                                  generator=generator).images
 
-                if cfg['EXPERIMENT']['FID_VALIDATION'] and (epoch == 0 or (epoch + 1) % cfg['TRAIN']['FID_VALIDATION_EPOCHS'] == 0 or epoch == cfg['TRAIN']['NUM_EPOCHS'] - 1):
+                polyp_images = pipeline(polyp_text_clef,
+                                        num_inference_steps=cfg['TRAIN']['NUM_INFERENCE_STEPS'],
+                                        height=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'],
+                                        width=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'],
+                                        num_images_per_prompt=9,
+                                        generator=generator).images
+
+                log_dict["Image validation"] = wandb.Image(image_grid(val_images, 3, 3), caption=val_caption_clef)
+                log_dict["Image Paraphrased validation"] = wandb.Image(image_grid(val_images_paraphrased, 3, 3), caption=val_clef_paraphrased_caption)
+                log_dict["Polyp validation"] = wandb.Image(image_grid(polyp_images, 3, 3), caption=polyp_text_clef[0])
+
+                if cfg['TRAIN']['FID_VALIDATION'] and (epoch == 0 or (epoch + 1) % cfg['TRAIN']['FID_VALIDATION_EPOCHS'] == 0 or epoch == cfg['TRAIN']['NUM_EPOCHS'] - 1):
                     fid_value, precision, recall = count_image_metrics(cfg, accelerator, pipeline, generator, fid_dataloader)
 
                     log_dict['FID'] = fid_value
                     log_dict['Precision'] = precision
                     log_dict['Recall'] = recall
                     log_dict['F1'] = 2 * (precision * recall) / (precision + recall)
-                    
-                    if cfg['EXPERIMENT']['SAVE_BEST_FID_CHECKPOINTS'] and fid_value < best_fid:
+
+                    if cfg['TRAIN']['SAVE_BEST_FID_CHECKPOINTS'] and fid_value < best_fid:
                         save_model_checkpoint(cfg, accelerator, unet)
                         best_fid = fid_value
 
                 del pipeline
                 torch.cuda.empty_cache()
-                            
+
             for tracker in accelerator.trackers:
                 if tracker.name == "wandb":
                     tracker.log(log_dict)

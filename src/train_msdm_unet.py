@@ -411,7 +411,6 @@ def main():
             if global_step >= max_train_steps:
                 break
 
-
     accelerator.wait_for_everyone()
     # if accelerator.is_main_process:
     #     unwrapped_unet = accelerator.unwrap_model(unet)
