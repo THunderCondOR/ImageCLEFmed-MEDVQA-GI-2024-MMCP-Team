@@ -1,25 +1,21 @@
 import argparse
 import math
 import wandb
-import numpy as np
 import os
-from lpips import LPIPS
 import torchvision
 
 import torch
-import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from diffusers.optimization import get_scheduler
-from diffusers.utils import convert_state_dict_to_diffusers
-from diffusers.training_utils import compute_snr
 from tqdm import tqdm
-from pytorch_msssim import SSIM, ssim
+from pytorch_msssim import ssim
 from PIL import Image
 
 from config.medfusion_config import get_cfg_defaults
 from dataset import ClefMedfusionVAEDataset
-from medical_diffusion.models.embedders.latent_embedders import VAE, VAELoss, VQVAE, VQVAELoss
+from msdm.models.embedders.latent_embedders import VAE, VAELoss, VQVAE, VQVAELoss
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -58,7 +54,6 @@ def image_grid(imgs, rows, cols):
     w, h = imgs[0].size
     grid = Image.new('RGB', size=(cols*w, rows*h))
     grid_w, grid_h = grid.size
-    
     for i, img in enumerate(imgs):
         grid.paste(img, box=(i % cols * w, i // cols * h))
     return grid
@@ -84,13 +79,13 @@ def main():
 
     set_seed(cfg['SYSTEM']['RANDOM_SEED'])
 
-    if cfg['EXPERIMENT']['VAE_MODEL_TYPE'] == 'VAE':
+    if cfg['TRAIN']['MSDM_VAE_MODEL_TYPE'] == 'VAE':
         vae = VAE(
-            in_channels=3, 
-            out_channels=3, 
+            in_channels=3,
+            out_channels=3,
             emb_channels=8,
             spatial_dims=2,
-            hid_chs =[64, 128, 256, 512], 
+            hid_chs=[64, 128, 256, 512],
             kernel_sizes=[3, 3, 3, 3],
             strides=[1, 2, 2, 2],
             deep_supervision=1,
@@ -98,26 +93,20 @@ def main():
         )
     else:
         vae = VQVAE(
-            in_channels=3, 
-            out_channels=3, 
+            in_channels=3,
+            out_channels=3,
             emb_channels=4,
             num_embeddings=8192,
             spatial_dims=2,
             hid_chs=[64, 128, 256, 512],
             beta=1,
             deep_supervision=True,
-            use_attention = 'none',
+            use_attention='none',
         )
     vae.requires_grad_(True)
 
-    # weight_dtype = torch.float32
-    # if accelerator.mixed_precision == "fp16":
-    #     weight_dtype = torch.float16
-    # elif accelerator.mixed_precision == "bf16":
-    #     weight_dtype = torch.bfloat16
-
     vae.to(accelerator.device, dtype=torch.float32)
-    
+
     optimizer_cls = torch.optim.Adam
 
     optimizer = optimizer_cls(
@@ -128,19 +117,19 @@ def main():
         weight_decay=cfg['OPTIMIZER']['ADAM_WEIGHT_DECAY']
     )
 
-    train_dataset = ClefMedfusionVAEDataset(cfg['EXPERIMENT']['DATASET_TRAIN_PATH'], resolution=cfg['TRAIN']['IMAGE_RESOLUTION'])
-    # val_dataset = ClefMedfusionVAEDataset(cfg['EXPERIMENT']['DATASET_TRAIN_PATH'], resolution=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'], train=False, load_to_ram=True)
+    train_dataset = ClefMedfusionVAEDataset(cfg['PATHS']['CLEF_DATASET_IMAGES_PATH'],
+                                            cfg['PATHS']['CLEF_DATASET_TEXTS_TRAIN_PATH'],
+                                            resolution=cfg['TRAIN']['TRAIN_IMAGE_RESOLUTION'])
 
-    def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        return {"pixel_values": pixel_values}
+    # val_dataset = ClefMedfusionVAEDataset(cfg['PATHS']['CLEF_DATASET_IMAGES_PATH'],
+    #                                       cfg['PATHS']['CLEF_DATASET_TEXTS_TRAIN_PATH'],
+    #                                       resolution=cfg['TRAIN']['VAL_IMAGE_RESOLUTION'])
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
-        collate_fn=collate_fn,
-        batch_size=cfg['TRAIN']['BATCH_SIZE'],
+        collate_fn=ClefMedfusionVAEDataset.collate_fn,
+        batch_size=cfg['TRAIN']['TRAIN_BATCH_SIZE'],
         num_workers=cfg['TRAIN']['DATALOADER_NUM_WORKERS'],
         pin_memory=True
     )
@@ -148,13 +137,13 @@ def main():
     # val_dataloader = torch.utils.data.DataLoader(
     #     val_dataset,
     #     shuffle=False,
-    #     collate_fn=collate_fn,
+    #     collate_fn=ClefMedfusionVAEDataset.collate_fn,
     #     batch_size=cfg['TRAIN']['VAL_BATCH_SIZE'],
     #     num_workers=cfg['TRAIN']['DATALOADER_NUM_WORKERS'],
     # )
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / cfg['ACCELERATOR']['ACCUMULATION_STEPS'])
-    max_train_steps = cfg['TRAIN']['EPOCHS'] * num_update_steps_per_epoch
+    max_train_steps = cfg['TRAIN']['NUM_EPOCHS'] * num_update_steps_per_epoch
 
     lr_scheduler = get_scheduler(
         name=cfg['SCHEDULER']['NAME'],
@@ -164,7 +153,7 @@ def main():
     )
 
     if accelerator.is_main_process:
-        accelerator.init_trackers(cfg['EXPERIMENT']['PROJECT_NAME'], config=cfg, init_kwargs={"wandb": {"name": cfg['EXPERIMENT']['NAME']}})
+        accelerator.init_trackers(cfg['WANDB']['PROJECT_NAME'], config=cfg, init_kwargs={"wandb": {"name": cfg['WANDB']['RUN_NAME']}})
 
     vae, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         vae, optimizer, train_dataloader, lr_scheduler
@@ -181,15 +170,16 @@ def main():
         disable=not accelerator.is_local_main_process
     )
 
-    if cfg['EXPERIMENT']['VAE_MODEL_TYPE'] == 'VAE':
-        loss_fn = VAELoss(loss = torch.nn.MSELoss, embedding_loss_weight=1e-6, device=accelerator.device)
+    if cfg['TRAIN']['MSDM_VAE_MODEL_TYPE'] == 'VAE':
+        loss_fn = VAELoss(loss=torch.nn.MSELoss, embedding_loss_weight=1e-6, device=accelerator.device)
     else:
-        loss_fn = VQVAELoss(loss = torch.nn.L1Loss, embedding_loss_weight=1.0, device=accelerator.device)
+        loss_fn = VQVAELoss(loss=torch.nn.L1Loss, embedding_loss_weight=1.0, device=accelerator.device)
 
-    for epoch in range(first_epoch, cfg['TRAIN']['EPOCHS']):
+    for epoch in range(first_epoch, cfg['TRAIN']['NUM_EPOCHS']):
         vae.train()
-        train_loss = 0.0
+
         for step, batch in enumerate(train_dataloader):
+            train_step_loss = 0.0
             with accelerator.accumulate(vae):
                 target = batch["pixel_values"]
 
@@ -199,8 +189,8 @@ def main():
                 loss = loss_fn(pred, pred_vertical, target, emb_loss)
 
                 # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(cfg['TRAIN']['BATCH_SIZE'])).mean()
-                train_loss += avg_loss.item() / cfg['ACCELERATOR']['ACCUMULATION_STEPS']
+                avg_loss = accelerator.gather(loss.repeat(cfg['TRAIN']['TRAIN_BATCH_SIZE'])).mean()
+                train_step_loss += avg_loss.item() / cfg['ACCELERATOR']['ACCUMULATION_STEPS']
 
                 accelerator.backward(loss)
                 optimizer.step()
@@ -210,7 +200,10 @@ def main():
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
-                accelerator.log({"vae_train_loss": train_loss}, step=global_step)
+                global_step += 1
+                logs = {"vae_step_loss": train_step_loss, "lr": lr_scheduler.get_last_lr()[0]}
+                progress_bar.set_postfix(**logs)
+                accelerator.log({"vae_train_loss": train_step_loss}, step=global_step)
 
                 if accelerator.is_main_process:
                     with torch.no_grad():
@@ -218,29 +211,26 @@ def main():
                         logging_dict['L2'] = torch.nn.functional.mse_loss(pred, target)
                         logging_dict['L1'] = torch.nn.functional.l1_loss(pred, target)
                         logging_dict['ssim'] = ssim((pred + 1) / 2, (target.type(pred.dtype) + 1) / 2, data_range=1)
-                    
-                    if (global_step) % cfg['TRAIN']['IMAGE_VALIDATION_STEPS'] == 0 or global_step + 1 == max_train_steps:
-                        logging_dict["Original"] = wandb.Image(torchvision.utils.make_grid(target[:9], nrow=3))
-                        logging_dict["Reconstruction"] = wandb.Image(torchvision.utils.make_grid(normalize(pred[:9]).clamp(0, 1), nrow=3))
+
                     for tracker in accelerator.trackers:
                         if tracker.name == "wandb":
                             tracker.log(logging_dict)
-                global_step += 1
-                train_loss = 0.0
-            
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
 
-            if global_step >= max_train_steps:
-                break
+        if accelerator.is_main_process:
+            if epoch == 0 or (epoch + 1) % cfg['TRAIN']['IMAGE_VALIDATION_EPOCHS'] == 0 or epoch == cfg['TRAIN']['NUM_EPOCHS'] - 1:
+                logging_dict["Original"] = wandb.Image(torchvision.utils.make_grid(target[:9], nrow=3))
+                logging_dict["Reconstruction"] = wandb.Image(torchvision.utils.make_grid(normalize(pred[:9]).clamp(0, 1), nrow=3))
 
+                for tracker in accelerator.trackers:
+                    if tracker.name == "wandb":
+                        tracker.log(logging_dict)
 
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
         vae = accelerator.unwrap_model(vae)
         torch.save({'state_dict': vae.state_dict()},
-                    os.path.join(cfg['EXPERIMENT']['MEDFUSION_VAE_OUTPUT_DIR'], cfg['EXPERIMENT']['MEDFUSION_VAE_SUBFOLDER'], cfg['EXPERIMENT']['VAE_CHECKPOINT_NAME']))
+                   os.path.join(cfg['PATHS']['MSDM_VAE_CHECKPOINT_DIR'], cfg['PATHS']['MSDM_VAE_CHECKPOINT_DIR']))
 
     accelerator.end_training()
 

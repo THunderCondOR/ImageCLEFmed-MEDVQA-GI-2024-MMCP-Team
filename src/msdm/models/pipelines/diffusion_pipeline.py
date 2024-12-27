@@ -19,36 +19,37 @@ def normalize(img):
     # img =  torch.stack([b.clamp(torch.quantile(b, 0.001), torch.quantile(b, 0.999)) for b in img])
     return torch.stack([(b-b.min())/(b.max()-b.min()) for b in img])
 
+
 class DiffusionPipeline(BasicModel):
-    def __init__(self, 
+    def __init__(self,
                  noise_scheduler,
                  unet,
                  tokenizer,
                  text_encoder,
                  latent_embedder=None,
-                 estimator_objective = 'x_T', # 'x_T' or 'x_0'
-                 estimate_variance=False, 
-                 use_self_conditioning=False, 
-                 classifier_free_guidance_dropout=0.5, # Probability to drop condition during training, has only an effect for label-conditioned training 
-                 num_samples = 4,
-                 do_input_centering = True, # Only for training
-                 clip_x0=True, # Has only an effect during traing if use_self_conditioning=True, import for inference/sampling  
-                 use_ema = False,
-                 ema_kwargs = {},
+                 estimator_objective='x_T',  # 'x_T' or 'x_0'
+                 estimate_variance=False,
+                 use_self_conditioning=False,
+                 classifier_free_guidance_dropout=0.5,  # Probability to drop condition during training, has only an effect for label-conditioned training 
+                 num_samples=4,
+                 do_input_centering=True,  # Only for training
+                 clip_x0=True,  # Has only an effect during traing if use_self_conditioning=True, import for inference/sampling  
+                 use_ema=False,
+                 ema_kwargs={},
                  loss=torch.nn.L1Loss,
                  loss_kwargs={},
-                 sample_every_n_steps = 1000,
+                 sample_every_n_steps=1000,
                  device='cpu'
                 ):
         # self.save_hyperparameters(ignore=['noise_estimator', 'noise_scheduler']) 
         super().__init__()
         self.loss_fct = loss(**loss_kwargs)
-        self.sample_every_n_steps=sample_every_n_steps
+        self.sample_every_n_steps = sample_every_n_steps
 
         self.noise_scheduler = noise_scheduler
         self.unet = unet
         self.tokenizer = tokenizer
-        
+
         self.latent_embedder = latent_embedder 
         self.text_encoder = text_encoder
 
@@ -73,13 +74,13 @@ class DiffusionPipeline(BasicModel):
             with torch.no_grad():
                 x_0 = self.latent_embedder.encode(x_0)
         if self.do_input_centering:
-            x_0 = 2*x_0-1 # [0, 1] -> [-1, 1]
+            x_0 = 2*x_0-1  # [0, 1] -> [-1, 1]
         # if self.clip_x0:
         #     x_0 = torch.clamp(x_0, -1, 1)
         # Sample Noise
         with torch.no_grad():
             # Randomly selecting t [0,T-1] and compute x_t (noisy version of x_0 at t)
-            x_t, x_T, t = self.noise_scheduler.sample(x_0) 
+            x_t, x_T, t = self.noise_scheduler.sample(x_0)
         # Use EMA Model
         if self.use_ema:
             noise_estimator = self.ema_model.averaged_model
@@ -154,16 +155,16 @@ class DiffusionPipeline(BasicModel):
             nnl_loss = torch.mean(F.gaussian_nll_loss(pred_x_0, x_0, torch.exp(pred_logvar), reduction='none'), dim=list(range(1, x_0.ndim)))
             var_loss = torch.mean(torch.where(t == 0, nnl_loss, kl_loss))
             loss += var_loss
-            
+
             results['variance_scale'] = torch.mean(var_scale)
             results['variance_loss'] = var_loss
-            
+
         # ----------------------------- Deep Supervision -------------------------
         for i, pred_i in enumerate(pred_vertical): 
             target_i = F.interpolate(target, size=pred_i.shape[2:], mode=interpolation_mode, align_corners=None)  
             loss += self.loss_fct(pred_i, target_i)*weights[i+1]
         results['loss']  = loss
-       
+
         # --------------------- Compute Metrics  -------------------------------
         with torch.no_grad():
             results['L2'] = F.mse_loss(pred, target)
@@ -173,9 +174,9 @@ class DiffusionPipeline(BasicModel):
             # for i, pred_i in enumerate(pred_vertical):
             #     target_i = F.interpolate(target, size=pred_i.shape[2:], mode=interpolation_mode, align_corners=None)  
             #     results[f'L1_{i}'] = F.l1_loss(pred_i, target_i).detach()           
-        
+
         return loss
-    
+
     def forward(self, x_t, t, condition_emb=None, condition_mask=None, self_cond=None, guidance_scale=1.0, cold_diffusion=False):
         # Note: x_t expected to be in range ~ [-1, 1]
         if self.use_ema:
@@ -188,17 +189,17 @@ class DiffusionPipeline(BasicModel):
             pred, _ = noise_estimator(torch.cat([x_t] * 2), torch.cat([t] * 2), condition_embed=condition_emb, condition_mask=condition_mask, self_cond=self_cond)
             pred_uncond, pred_cond = pred.chunk(2)
             pred = (guidance_scale + 1.0) * pred_cond - guidance_scale * pred_uncond
-            #pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
+            # pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
 
             if self.estimate_variance:
                 pred_uncond, pred_var_uncond =  pred_uncond.chunk(2, dim = 1)  
                 pred_cond,   pred_var_cond =  pred_cond.chunk(2, dim = 1) 
                 pred_var = pred_var_uncond + guidance_scale * (pred_var_cond - pred_var_uncond)
         else:
-            #condition_emb = self.text_encoder(condition, attention_mask=condition_mask, return_dict=False)[0]
+            # condition_emb = self.text_encoder(condition, attention_mask=condition_mask, return_dict=False)[0]
             pred, _ =  noise_estimator(x_t, t, condition_emb=condition_emb, condition_mask=condition_mask, self_cond=self_cond)
             if self.estimate_variance:
-                pred, pred_var =  pred.chunk(2, dim = 1)  
+                pred, pred_var = pred.chunk(2, dim=1)
 
         if self.estimate_variance:
             pred_var_scale = pred_var/2+0.5 # [-1, 1] -> [0, 1]
@@ -253,7 +254,7 @@ class DiffusionPipeline(BasicModel):
         return x_t # Should be x_0 in final step (t=0)
 
     @torch.no_grad()
-    def sample(self, num_samples, img_size, prompts=None, generator=None, guidance_scale=1.0, **kwargs):
+    def sample(self, num_samples, height=256, width=256, prompts=None, generator=None, guidance_scale=1.0, **kwargs):
         condition, condition_mask = None, None
         uncond, uncond_mask = None, None
         if prompts is not None:
@@ -266,13 +267,12 @@ class DiffusionPipeline(BasicModel):
             uncond_emb = self.text_encoder(uncond, attention_mask=uncond_mask, return_dict=False)[0]
             condition_emb = torch.cat([uncond_emb, condition_emb])
             condition_mask = torch.cat([uncond_mask, condition_mask]).bool()
-        x_T = self.noise_scheduler.x_final_deterministic((num_samples, self.unet.num_channels, img_size[0] // 8, img_size[1] // 8), generator=generator, device=self.device)
+        x_T = self.noise_scheduler.x_final_deterministic((num_samples, self.unet.num_channels, height // 8, width // 8), generator=generator, device=self.device)
         x_0 = self.denoise(x_T, condition_emb=condition_emb, condition_mask=condition_mask, guidance_scale=guidance_scale, **kwargs)
-        return x_0 
-
+        return x_0
 
     @torch.no_grad()
-    def interpolate(self, img1, img2, i = None, condition=None, condition_mask=None, lam = 0.5, **kwargs):
+    def interpolate(self, img1, img2, i=None, condition=None, condition_mask=None, lam=0.5, **kwargs):
         assert img1.shape == img2.shape, "Image 1 and 2 must have equal shape"
 
         t = self.noise_scheduler.T-1 if i is None else i

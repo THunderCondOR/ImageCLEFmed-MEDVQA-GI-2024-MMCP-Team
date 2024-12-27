@@ -3,6 +3,7 @@ import pandas as pd
 from PIL import Image
 import torchvision.transforms as T
 import torch
+import torch.nn as nn
 
 from torch.utils.data import Dataset
 
@@ -15,11 +16,9 @@ class Kandinsky2PriorDataset(Dataset):
                  image_processor,
                  prompt_column_name='Prompt',
                  image_column_name='Filename',
-                 resolution=256,
-                 random_seed=2204):
+                 resolution=256):
         super().__init__()
 
-        self.random_state = np.random.RandomState(random_seed)
         self.images_path = images_path
         self.texts_path = texts_path
         self.tokenizer = tokenizer
@@ -68,7 +67,6 @@ class Kandinsky2DecoderDataset(Dataset):
                  random_seed=2204):
         super().__init__()
 
-        self.random_state = np.random.RandomState(random_seed)
         self.images_path = images_path
         self.texts_path = texts_path
         self.resolution = resolution
@@ -125,11 +123,9 @@ class Kandinsky3Dataset(Dataset):
                  prompt_column_name='Prompt',
                  image_file_col='Filename',
                  resolution=256,
-                 padding=False,
-                 random_seed=2204):
+                 padding=False):
         super().__init__()
 
-        self.random_state = np.random.RandomState(random_seed)
         self.images_path = images_path
         self.texts_path = texts_path
         self.resolution = resolution
@@ -189,10 +185,10 @@ class ClefFIDDataset(Dataset):
     def __init__(self,
                  images_path,
                  texts_path,
+                 prompt_column_name='Prompt',
                  image_file_col='Filename',
-                 captions_col='Prompt',
                  resolution=256,
-                 padding=True,
+                 padding=False,
                  random_seed=2204):
         super().__init__()
 
@@ -204,7 +200,7 @@ class ClefFIDDataset(Dataset):
 
         self.prompts_info = pd.read_csv(self.texts_path, header=0, delimiter=';')
         self.image_files = self.prompts_info[image_file_col].unique()
-        self.texts = self.prompts_info[captions_col].sample(2000).tolist()
+        self.texts = self.prompts_info[prompt_column_name].sample(2000).tolist()
 
     def __len__(self):
         return len(self.texts)
@@ -235,51 +231,26 @@ class ClefFIDDataset(Dataset):
 
 class ClefMsdmVAEDataset(Dataset):
     def __init__(self,
-                 path,
-                 csv_filename='prompt-gt.csv',
-                 resolution=256,
-                 train=True,
-                 load_to_ram=False,
-                 random_seed=2204):
+                 images_path,
+                 texts_path,
+                 image_column_name='Filename',
+                 resolution=256):
         super().__init__()
 
-        self.random_state = np.random.RandomState(random_seed)
-        self.path = path
+        self.images_path = images_path
+        self.texts_path = texts_path
         self.resolution = resolution
-        self.load_to_ram = load_to_ram
-        self.train = train
 
-        self.prompts_info = pd.read_csv(self.path + f'/{csv_filename}', header=0, delimiter=';')
+        self.data = pd.read_csv(self.texts_path)
 
-        self.image_files = self.prompts_info['Filename'].unique()
-
-        if not train:
-            self.prompts_info['original_index'] = self.prompts_info.index
-            val_indexes = self.prompts_info.groupby('Filename').apply(lambda x: x.sample(1, random_state=self.random_state)).sample(9)['original_index'].to_numpy()
-            self.texts = self.prompts_info.iloc[val_indexes, 0].tolist()
-            self.image_ids, self.image_files = pd.factorize(self.prompts_info.iloc[val_indexes, 1])
-
-        if load_to_ram:
-            self.images = self._load_images(self.image_files)
-
-    def _load_images(self, image_files):
-        images = []
-        for filename in image_files:
-            image = Image.open(f'{self.path}/images/{filename}').convert('RGB')
-            transform = T.Compose([T.CenterCrop(min(image.size)),
-                                   T.Resize(self.resolution),
-                                   T.ToTensor(),
-                                   ])
-            images += [transform(image)]
-
-        return images
+        self.image_files = self.data[image_column_name].tolist()
 
     def __len__(self):
         return len(self.image_files)
 
     def __getitem__(self, item):
         filename = self.image_files[item]
-        image = Image.open(f'{self.path}/images/{filename}').convert('RGB')
+        image = Image.open(f'{self.images_path}/images/{filename}').convert('RGB')
         transform = T.Compose([T.CenterCrop(min(image.size)),
                                T.Resize(self.resolution),
                                T.ToTensor(),
@@ -287,63 +258,69 @@ class ClefMsdmVAEDataset(Dataset):
 
         return {"pixel_values": transform(image).to(torch.float32)}
 
+    @staticmethod
+    def collate_fn(examples):
+        pixel_values = torch.stack([example["pixel_values"] for example in examples])
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        return {"pixel_values": pixel_values}
+
 
 class ClefMsdmUnetDataset(Dataset):
     def __init__(self,
-                 path,
+                 images_path,
+                 texts_path,
                  tokenizer,
+                 image_file_col='Filename',
+                 prompt_column_name='Prompt',
+                 paraphrases_col='Paraphrase',
                  resolution=64,
-                 csv_filename='prompt-gt.csv',
-                 train=True,
-                 num_val_images=200,
-                 random_seed=2204,
                  p_dropout=0,
                  add_paraphrase=False,
+                 train=True,
                  p_paraphrase=0,
                  ):
         super().__init__()
 
-        self.random_state = np.random.RandomState(random_seed)
-        self.path = path
+        self.images_path = images_path
+        self.texts_path = texts_path
         self.tokenizer = tokenizer
-        self.train = train
         self.resolution = resolution
         self.p_dropout = p_dropout
         self.p_paraphrase = p_paraphrase
         self.add_paraphrase = add_paraphrase
+        self.train = train
 
         empty_context = tokenizer(
             [''], max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
         self.empty_ids, self.empty_mask = empty_context['input_ids'][0], empty_context['attention_mask'][0].bool()
-        self.prompts_info = pd.read_csv(self.path + f'/{csv_filename}', header=0, delimiter=';')
 
-        val_images = self.prompts_info.groupby('Filename').count().sample(num_val_images).index
+        self.data = pd.read_csv(self.texts_path)
 
-        if train:
-            data = self.prompts_info[~self.prompts_info['Filename'].isin(val_images)]
-        else:
-            data = self.prompts_info[self.prompts_info['Filename'].isin(val_images)]
+        self.image_files = self.data[image_file_col].tolist()
 
-        self.texts = data['Prompt'].tolist()
-        self.paraphrases = data['Paraphrase'].tolist()
-        self.image_files = data['Filename'].tolist()
-        if add_paraphrase:
+        self.texts = self.data[prompt_column_name].tolist()
+        self.paraphrases = self.data[paraphrases_col].tolist()
+
+        if self.add_paraphrase:
             self.texts += self.paraphrases
             self.image_files *= 2
+
         self.tokenized_texts = tokenizer(
             self.texts, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
-        self.tokenized_paraphrases = tokenizer(
-            self.paraphrases, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-        )
+
+        if not self.add_paraphrase:
+            self.tokenized_paraphrases = tokenizer(
+                    self.paraphrases, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+            )
 
     def __len__(self):
         return len(self.tokenized_texts['input_ids'])
 
     def __getitem__(self, item):
         filename = self.image_files[item]
-        image = Image.open(f'{self.path}/images/{filename}').convert('RGB')
+        image = Image.open(f'{self.images_path}/images/{filename}').convert('RGB')
         drop_context = torch.rand(1) < self.p_dropout
         paraphrase = False
         if not drop_context and not self.add_paraphrase:
@@ -371,3 +348,11 @@ class ClefMsdmUnetDataset(Dataset):
         return {"pixel_values": image,
                 "input_ids": input_ids,
                 "attention_mask": attention_mask}
+
+    @staticmethod
+    def collate_fn(examples):
+        pixel_values = torch.stack([example["pixel_values"] for example in examples])
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        input_ids = torch.stack([example["input_ids"] for example in examples])
+        attention_mask = torch.stack([example["attention_mask"] for example in examples])
+        return {"pixel_values": pixel_values, "input_ids": input_ids, "attention_mask": attention_mask}
