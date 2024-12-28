@@ -1,10 +1,5 @@
-from pathlib import Path 
-from tqdm import tqdm
-
-import torch 
-import torch.nn.functional as F 
-from torchvision.utils import save_image 
-import streamlit as st
+import torch
+import torch.nn.functional as F
 
 from msdm.models.model_base import BasicModel
 from msdm.utils.train_utils import EMAModel
@@ -12,7 +7,7 @@ from msdm.utils.train_utils import EMAModel
 
 def kl_gaussians(mean1, logvar1, mean2, logvar2):
     """ Compute the KL divergence between two gaussians."""
-    return 0.5 * (logvar2-logvar1 + torch.exp(logvar1 - logvar2) + torch.pow(mean1 - mean2, 2) * torch.exp(-logvar2)-1.0)
+    return 0.5 * (logvar2-logvar1 + torch.exp(logvar1 - logvar2) + torch.pow(mean1 - mean2, 2) * torch.exp(-logvar2) - 1.0)
 
 
 def normalize(img):
@@ -40,8 +35,8 @@ class DiffusionPipeline(BasicModel):
                  loss_kwargs={},
                  sample_every_n_steps=1000,
                  device='cpu'
-                ):
-        # self.save_hyperparameters(ignore=['noise_estimator', 'noise_scheduler']) 
+                 ):
+        # self.save_hyperparameters(ignore=['noise_estimator', 'noise_scheduler'])
         super().__init__()
         self.loss_fct = loss(**loss_kwargs)
         self.sample_every_n_steps = sample_every_n_steps
@@ -50,7 +45,7 @@ class DiffusionPipeline(BasicModel):
         self.unet = unet
         self.tokenizer = tokenizer
 
-        self.latent_embedder = latent_embedder 
+        self.latent_embedder = latent_embedder
         self.text_encoder = text_encoder
 
         self.estimator_objective = estimator_objective
@@ -68,9 +63,9 @@ class DiffusionPipeline(BasicModel):
 
     def step(self, x_0, condition=None, condition_mask=None):
         results = {}
-        # Embed into latent space or normalize 
+        # Embed into latent space or normalize
         if self.latent_embedder is not None:
-            self.latent_embedder.eval() 
+            self.latent_embedder.eval()
             with torch.no_grad():
                 x_0 = self.latent_embedder.encode(x_0)
         if self.do_input_centering:
@@ -89,40 +84,40 @@ class DiffusionPipeline(BasicModel):
 
         with torch.no_grad():
             condition_emb = self.text_encoder(condition, attention_mask=condition_mask, return_dict=False)[0]
-        # Re-estimate x_T or x_0, self-conditioned on previous estimate 
-        self_cond = None 
+        # Re-estimate x_T or x_0, self-conditioned on previous estimate
+        self_cond = None
         if self.use_self_conditioning:
             with torch.no_grad():
-                pred, pred_vertical = noise_estimator(x_t, t, condition_emb, condition_mask, None) 
+                pred, pred_vertical = noise_estimator(x_t, t, condition_emb, condition_mask, None)
                 if self.estimate_variance:
-                    pred, _ =  pred.chunk(2, dim = 1)  # Seperate actual prediction and variance estimation 
-                if self.estimator_objective == "x_T": # self condition on x_0 
+                    pred, _ = pred.chunk(2, dim=1)  # Seperate actual prediction and variance estimation
+                if self.estimator_objective == "x_T":  # self condition on x_0
                     self_cond = self.noise_scheduler.estimate_x_0(x_t, pred, t=t, clip_x0=self.clip_x0)
-                elif self.estimator_objective == "x_0": # self condition on x_T 
+                elif self.estimator_objective == "x_0":  # self condition on x_T
                     self_cond = self.noise_scheduler.estimate_x_T(x_t, pred, t=t, clip_x0=self.clip_x0)
                 else:
                     raise NotImplementedError(f"Option estimator_target={self.estimator_objective} not supported.")
-            
-        # Classifier free guidance 
-        if torch.rand(1)<self.classifier_free_guidance_dropout:
-            condition = None 
-       
-        # Run Denoise 
-        
-        pred, pred_vertical = noise_estimator(x_t, t, condition_emb, condition_mask, self_cond) 
-        
-        # Separate variance (scale) if it was learned 
-        if self.estimate_variance:
-            pred, pred_var =  pred.chunk(2, dim = 1)  # Separate actual prediction and variance estimation 
 
-        # Specify target 
+        # Classifier free guidance
+        if torch.rand(1) < self.classifier_free_guidance_dropout:
+            condition = None
+
+        # Run Denoise
+
+        pred, pred_vertical = noise_estimator(x_t, t, condition_emb, condition_mask, self_cond)
+
+        # Separate variance (scale) if it was learned
+        if self.estimate_variance:
+            pred, pred_var =  pred.chunk(2, dim=1)  # Separate actual prediction and variance estimation
+
+        # Specify target
         if self.estimator_objective == "x_T":
-            target = x_T 
+            target = x_T
         elif self.estimator_objective == "x_0":
-            target = x_0 
+            target = x_0
         else:
             raise NotImplementedError(f"Option estimator_target={self.estimator_objective} not supported.")
-        
+
         # ------------------------- Compute Loss ---------------------------
         interpolation_mode = 'area'
         loss = 0
@@ -134,15 +129,15 @@ class DiffusionPipeline(BasicModel):
 
         # ----------------- Variance Loss --------------
         if self.estimate_variance:
-            # var_scale = var_scale.clamp(-1, 1) # Should not be necessary 
-            var_scale = (pred_var+1)/2 # Assumed to be in [-1, 1] -> [0, 1] 
+            # var_scale = var_scale.clamp(-1, 1) # Should not be necessary
+            var_scale = (pred_var+1)/2 # Assumed to be in [-1, 1] -> [0, 1]
             pred_logvar = self.noise_scheduler.estimate_variance_t(t, x_t.ndim, log=True, var_scale=var_scale)
-            # pred_logvar = pred_var  # If variance is estimated directly 
+            # pred_logvar = pred_var  # If variance is estimated directly
 
-            if  self.estimator_objective == 'x_T':
+            if self.estimator_objective == 'x_T':
                 pred_x_0 = self.noise_scheduler.estimate_x_0(x_t, x_T, t, clip_x0=self.clip_x0)
             elif self.estimator_objective == "x_0":
-                pred_x_0 = pred 
+                pred_x_0 = pred
             else:
                 raise NotImplementedError()
 
@@ -150,7 +145,7 @@ class DiffusionPipeline(BasicModel):
                 pred_mean = self.noise_scheduler.estimate_mean_t(x_t, pred_x_0, t)
                 true_mean = self.noise_scheduler.estimate_mean_t(x_t, x_0, t)
                 true_logvar = self.noise_scheduler.estimate_variance_t(t, x_t.ndim, log=True, var_scale=0)
-            
+
             kl_loss = torch.mean(kl_gaussians(true_mean, true_logvar, pred_mean, pred_logvar), dim=list(range(1, x_0.ndim)))
             nnl_loss = torch.mean(F.gaussian_nll_loss(pred_x_0, x_0, torch.exp(pred_logvar), reduction='none'), dim=list(range(1, x_0.ndim)))
             var_loss = torch.mean(torch.where(t == 0, nnl_loss, kl_loss))
@@ -160,10 +155,10 @@ class DiffusionPipeline(BasicModel):
             results['variance_loss'] = var_loss
 
         # ----------------------------- Deep Supervision -------------------------
-        for i, pred_i in enumerate(pred_vertical): 
-            target_i = F.interpolate(target, size=pred_i.shape[2:], mode=interpolation_mode, align_corners=None)  
+        for i, pred_i in enumerate(pred_vertical):
+            target_i = F.interpolate(target, size=pred_i.shape[2:], mode=interpolation_mode, align_corners=None)
             loss += self.loss_fct(pred_i, target_i)*weights[i+1]
-        results['loss']  = loss
+        results['loss'] = loss
 
         # --------------------- Compute Metrics  -------------------------------
         with torch.no_grad():
@@ -172,8 +167,8 @@ class DiffusionPipeline(BasicModel):
             # results['SSIM'] = SSIMMetric(data_range=pred.max()-pred.min(), spatial_dims=source.ndim-2)(pred, target)
 
             # for i, pred_i in enumerate(pred_vertical):
-            #     target_i = F.interpolate(target, size=pred_i.shape[2:], mode=interpolation_mode, align_corners=None)  
-            #     results[f'L1_{i}'] = F.l1_loss(pred_i, target_i).detach()           
+            #     target_i = F.interpolate(target, size=pred_i.shape[2:], mode=interpolation_mode, align_corners=None)
+            #     results[f'L1_{i}'] = F.l1_loss(pred_i, target_i).detach()
 
         return loss
 
@@ -192,8 +187,8 @@ class DiffusionPipeline(BasicModel):
             # pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
 
             if self.estimate_variance:
-                pred_uncond, pred_var_uncond =  pred_uncond.chunk(2, dim = 1)  
-                pred_cond,   pred_var_cond =  pred_cond.chunk(2, dim = 1) 
+                pred_uncond, pred_var_uncond = pred_uncond.chunk(2, dim=1)
+                pred_cond,   pred_var_cond = pred_cond.chunk(2, dim=1)
                 pred_var = pred_var_uncond + guidance_scale * (pred_var_cond - pred_var_uncond)
         else:
             # condition_emb = self.text_encoder(condition, attention_mask=condition_mask, return_dict=False)[0]
@@ -202,25 +197,24 @@ class DiffusionPipeline(BasicModel):
                 pred, pred_var = pred.chunk(2, dim=1)
 
         if self.estimate_variance:
-            pred_var_scale = pred_var/2+0.5 # [-1, 1] -> [0, 1]
-            pred_var_value = pred_var  
+            pred_var_scale = pred_var / 2 + 0.5 # [-1, 1] -> [0, 1]
+            pred_var_value = pred_var
         else:
             pred_var_scale = 0
-            pred_var_value = None 
+            pred_var_value = None
         # pred_var_scale = pred_var_scale.clamp(0, 1)
-        if  self.estimator_objective == 'x_0':
+        if self.estimator_objective == 'x_0':
             x_t_prior, x_0 = self.noise_scheduler.estimate_x_t_prior_from_x_0(x_t, t, pred, clip_x0=self.clip_x0, var_scale=pred_var_scale, cold_diffusion=cold_diffusion)
             x_T = self.noise_scheduler.estimate_x_T(x_t, x_0=pred, t=t, clip_x0=self.clip_x0)
-            self_cond = x_T 
+            self_cond = x_T
         elif self.estimator_objective == 'x_T':
             x_t_prior, x_0 = self.noise_scheduler.estimate_x_t_prior_from_x_T(x_t, t, pred, clip_x0=self.clip_x0, var_scale=pred_var_scale, cold_diffusion=cold_diffusion)
-            x_T = pred 
-            self_cond = x_0 
+            x_T = pred
+            self_cond = x_0
         else:
             raise ValueError("Unknown Objective")
-        
-        return x_t_prior, x_0, x_T, self_cond 
 
+        return x_t_prior, x_0, x_T, self_cond 
 
     @torch.no_grad()
     def denoise(self, x_t, steps=None, condition_emb=None, condition_mask=None, guidance_scale=1.0, use_ddim=True, **kwargs):
@@ -228,16 +222,16 @@ class DiffusionPipeline(BasicModel):
         # ---------- run denoise loop ---------------
         if use_ddim:
             steps = self.noise_scheduler.timesteps if steps is None else steps
-            timesteps_array = torch.linspace(0, self.noise_scheduler.T-1, steps, dtype=torch.long, device=x_t.device) # [0, 1, 2, ..., T-1] if steps = T 
+            timesteps_array = torch.linspace(0, self.noise_scheduler.T-1, steps, dtype=torch.long, device=x_t.device)  # [0, 1, 2, ..., T-1] if steps = T 
         else:
-            timesteps_array = self.noise_scheduler.timesteps_array[slice(0, steps)] # [0, ...,T-1] (target time not time of x_t)
-            
+            timesteps_array = self.noise_scheduler.timesteps_array[slice(0, steps)]  # [0, ...,T-1] (target time not time of x_t)
+
         for i, t in enumerate(reversed(timesteps_array)):
             # UNet prediction 
             x_t, x_0, x_T, self_cond = self(x_t, t.expand(x_t.shape[0]), condition_emb, condition_mask, self_cond=self_cond, guidance_scale=guidance_scale, **kwargs)
-            self_cond = self_cond if self.use_self_conditioning else None  
-        
-            if use_ddim and (steps-i-1>0):
+            self_cond = self_cond if self.use_self_conditioning else None
+
+            if use_ddim and (steps-i - 1 > 0):
                 t_next = timesteps_array[steps-i-2]
                 alpha = self.noise_scheduler.alphas_cumprod[t]
                 alpha_next = self.noise_scheduler.alphas_cumprod[t_next]
@@ -249,7 +243,7 @@ class DiffusionPipeline(BasicModel):
         # ------ Eventually decode from latent space into image space--------
         if self.latent_embedder is not None:
             x_t = self.latent_embedder.decode(x_t)
-        
+
         x_t = normalize(x_t).clamp(0, 1)
         return x_t # Should be x_0 in final step (t=0)
 

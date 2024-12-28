@@ -1,7 +1,5 @@
-from pathlib import Path
-import json
-import torch 
 import torch.nn as nn
+
 
 class BasicModel(nn.Module):
     def __init__(self):
@@ -13,24 +11,24 @@ class BasicModel(nn.Module):
     def forward(self, x_in):
         raise NotImplementedError
 
-    def _step(self, batch: dict, batch_idx: int, state: str, step: int, optimizer_idx:int):
+    def _step(self, batch: dict, batch_idx: int, state: str, step: int, optimizer_idx: int):
         raise NotImplementedError
 
-    def training_step(self, batch: dict, batch_idx: int, optimizer_idx:int = 0 ):
-        self._step_train += 1 # =self.global_step
+    def training_step(self, batch: dict, batch_idx: int, optimizer_idx: int = 0):
+        self._step_train += 1  # =self.global_step
         return self._step(batch, batch_idx, "train", self._step_train, optimizer_idx)
 
-    def validation_step(self, batch: dict, batch_idx: int, optimizer_idx:int = 0):
+    def validation_step(self, batch: dict, batch_idx: int, optimizer_idx: int = 0):
         self._step_val += 1
-        return self._step(batch, batch_idx, "val", self._step_val, optimizer_idx )
+        return self._step(batch, batch_idx, "val", self._step_val, optimizer_idx)
 
-    def test_step(self, batch: dict, batch_idx: int, optimizer_idx:int = 0):
+    def test_step(self, batch: dict, batch_idx: int, optimizer_idx: int = 0):
         self._step_test += 1
         return self._step(batch, batch_idx, "test", self._step_test, optimizer_idx)
 
     def _epoch_end(self, outputs: list, state: str):
-        return 
-    
+        return
+
     def training_epoch_end(self, outputs):
         self._epoch_end(outputs, "train")
 

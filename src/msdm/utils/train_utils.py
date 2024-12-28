@@ -1,9 +1,10 @@
 import copy
-import torch 
-import torch.nn as nn 
+import torch
+import torch.nn as nn
+
 
 class EMAModel(nn.Module):
-    # See: https://github.com/huggingface/diffusers/blob/3100bc967084964480628ae61210b7eaa7436f1d/src/diffusers/training_utils.py#L42  
+    # See: https://github.com/huggingface/diffusers/blob/3100bc967084964480628ae61210b7eaa7436f1d/src/diffusers/training_utils.py#L42 
     """
     Exponential Moving Average of models weights
     """
@@ -13,7 +14,7 @@ class EMAModel(nn.Module):
         model,
         update_after_step=0,
         inv_gamma=1.0,
-        power=2 / 3,
+        power=2/3,
         min_value=0.0,
         max_value=0.9999,
     ):
@@ -39,7 +40,7 @@ class EMAModel(nn.Module):
         self.min_value = min_value
         self.max_value = max_value
 
-        self.averaged_model = self.averaged_model #.to(device=model.device)
+        self.averaged_model = self.averaged_model  # .to(device=model.device)
 
         self.decay = 0.0
         self.optimization_step = 0

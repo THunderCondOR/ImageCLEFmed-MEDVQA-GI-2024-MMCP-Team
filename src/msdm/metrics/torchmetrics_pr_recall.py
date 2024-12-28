@@ -1,19 +1,18 @@
 from typing import Optional, List
 
-import torch 
+import torch
 from torch import Tensor
 from torchmetrics import Metric
-import torchvision.models as models
-from torchvision import transforms
 
 from torchmetrics.utilities.imports import _TORCH_FIDELITY_AVAILABLE
 
 if _TORCH_FIDELITY_AVAILABLE:
     from torch_fidelity.feature_extractor_inceptionv3 import FeatureExtractorInceptionV3
 else:
-    class FeatureExtractorInceptionV3(Module):  # type: ignore
+    class FeatureExtractorInceptionV3(torch.nn.Module):  # type: ignore
         pass
     __doctest_skip__ = ["ImprovedPrecessionRecall", "IPR"]
+
 
 class NoTrainInceptionV3(FeatureExtractorInceptionV3):
     def __init__(
@@ -50,15 +49,13 @@ class NoTrainInceptionV3(FeatureExtractorInceptionV3):
 #     # transforms.CenterCrop(224),
 #     Normalize(), # scale to [0, 1]
 #     transforms.Normalize([0.485, 0.456, 0.406],[0.229, 0.224, 0.225])
-# ])        
-
+# ])
 
 
 class ImprovedPrecessionRecall(Metric):
     is_differentiable: bool = False
     higher_is_better: bool = True
     full_state_update: bool = False
-
 
     def __init__(self, feature=2048, knn=3, splits_real=1, splits_fake=5, normalize=False):
         super().__init__()
@@ -96,14 +93,12 @@ class ImprovedPrecessionRecall(Metric):
 
         # --------------------------- End Feature Extractor ---------------------------------------------------------------
 
-        self.knn = knn 
+        self.knn = knn
         self.splits_real = splits_real
         self.splits_fake = splits_fake
         self.add_state("real_features", [], dist_reduce_fx=None)
         self.add_state("fake_features", [], dist_reduce_fx=None)
-        self.normalize=normalize
-
-        
+        self.normalize = normalize
 
     def update(self, imgs: Tensor, real: bool) -> None:  # type: ignore
         """Update the state with extracted features.
@@ -115,9 +110,9 @@ class ImprovedPrecessionRecall(Metric):
         if not self.normalize:
             assert torch.is_tensor(imgs) and imgs.dtype == torch.uint8, 'Expecting image as torch.Tensor with dtype=torch.uint8'
         else:
-            imgs=(imgs * 255).byte()
+            imgs = (imgs * 255).byte()
 
-        features = self.feature_extractor(imgs).view(imgs.shape[0], -1)  
+        features = self.feature_extractor(imgs).view(imgs.shape[0], -1)
 
         if real:
             self.real_features.append(features)
@@ -138,17 +133,20 @@ class ImprovedPrecessionRecall(Metric):
         recall = _compute_metric(fake_features, fake_radii, self.splits_fake, real_features, self.splits_real)
 
         return precision, recall
-    
+
+
 def _compute_metric(ref_features, ref_radii, ref_splits, pred_features, pred_splits):
     dist = _compute_pairwise_distances(ref_features, ref_splits, pred_features, pred_splits)
-    num_feat = pred_features.shape[0] 
+    num_feat = pred_features.shape[0]
     count = 0
     for i in range(num_feat):
         count += (dist[:, i] < ref_radii).any()
     return count / num_feat
 
+
 def _distances2radii(distances, knn):
     return torch.topk(distances, knn+1, dim=1, largest=False)[0].max(dim=1)[0]
+
 
 def _compute_pairwise_distances(X, splits_x, Y=None, splits_y=None):
     # X = [B, features]
@@ -159,12 +157,12 @@ def _compute_pairwise_distances(X, splits_x, Y=None, splits_y=None):
     splits_y = splits_x if splits_y is None else splits_y
     dist = torch.concat([
         torch.concat([
-            (torch.sum(X_batch**2, dim=1, keepdim=True) + 
-             torch.sum(Y_batch**2, dim=1, keepdim=True).t() - 
-             2 * torch.einsum("bd,dn->bn", X_batch, Y_batch.t())) 
-        for Y_batch in Y.chunk(splits_y, dim=0)], dim=1)
+            (torch.sum(X_batch**2, dim=1, keepdim=True) +
+             torch.sum(Y_batch**2, dim=1, keepdim=True).t() -
+             2 * torch.einsum("bd,dn->bn", X_batch, Y_batch.t()))
+            for Y_batch in Y.chunk(splits_y, dim=0)], dim=1)
         for X_batch in X.chunk(splits_x, dim=0)])
 
     # dist = torch.maximum(dist, torch.zeros_like(dist))
-    dist[dist<0] = 0
+    dist[dist < 0] = 0
     return torch.sqrt(dist)
